@@ -1,7 +1,18 @@
 import com.fazecast.jSerialComm.SerialPort;
 import java.util.Scanner;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 public class TinkercadSensorReader {
+    // Logger para substituir printStackTrace
+    private static final Logger LOGGER = Logger.getLogger(TinkercadSensorReader.class.getName());
+
+    // Flag para controlar o loop principal
+    private static volatile boolean running = true;
+
+    // Objeto para sincronização
+    private static final Object LOCK = new Object();
+
     // Estrutura para armazenar os dados dos sensores
     static class SensorData {
         float temperatura = 0.0f;
@@ -11,7 +22,7 @@ public class TinkercadSensorReader {
 
         @Override
         public String toString() {
-            return String.format("Temperatura: %.1f °C, Umidade: %d %%, Luminosidade: %.0f lux, Nível de Água: %d %%",
+            return String.format("Temperatura: %.1f °C, Umidade: %d%%, Luminosidade: %.0f lux, Nível de Água: %d%%",
                     temperatura, umidade, luminosidade, nivelAgua);
         }
     }
@@ -57,9 +68,10 @@ public class TinkercadSensorReader {
         try {
             // Configura a porta com a mesma taxa de baud do Arduino (9600)
             comPort.setComPortParameters(9600, 8, SerialPort.ONE_STOP_BIT, SerialPort.NO_PARITY);
-            comPort.setComPortTimeouts(SerialPort.TIMEOUT_READ_SEMI_BLOCKING, 100, 0);
+            // Aumentando o timeout para melhorar a estabilidade da leitura
+            comPort.setComPortTimeouts(SerialPort.TIMEOUT_READ_SEMI_BLOCKING, 500, 0);
 
-            System.out.println("Lendo dados dos sensores do Tinkercad. Pressione Enter para sair...");
+            System.out.println("Conectado ao Arduino. Lendo dados dos sensores. Pressione Enter para sair...");
 
             // Buffer para armazenar dados parciais entre leituras
             StringBuilder dataBuffer = new StringBuilder();
@@ -67,19 +79,19 @@ public class TinkercadSensorReader {
             // Objeto para armazenar os últimos dados lidos
             SensorData currentData = new SensorData();
 
-            // Cria uma thread separada para ler a entrada do usuário
-            Thread inputThread = new Thread(() -> {
-                try {
-                    System.in.read();
-                } catch (Exception e) {
-                    // Ignorar exceções
-                }
-            });
-            inputThread.setDaemon(true);
+            // Thread para monitorar entrada do usuário
+            Thread inputThread = createInputThread();
             inputThread.start();
 
+            // Aguarda um momento para o Arduino inicializar
+            Thread.sleep(2000);
+
+            // Envia um comando para iniciar a leitura dos sensores (se necessário)
+            String startCommand = "START\n";
+            comPort.writeBytes(startCommand.getBytes(), startCommand.length());
+
             // Loop para ler dados até que a thread de entrada termine
-            while (inputThread.isAlive() && !Thread.currentThread().isInterrupted()) {
+            while (running && !Thread.currentThread().isInterrupted()) {
                 if (comPort.bytesAvailable() > 0) {
                     byte[] readBuffer = new byte[comPort.bytesAvailable()];
                     int numRead = comPort.readBytes(readBuffer, readBuffer.length);
@@ -91,12 +103,18 @@ public class TinkercadSensorReader {
                         processCompleteLines(dataBuffer, currentData);
                     }
                 }
-                // Pequeno delay para reduzir o uso da CPU
-                Thread.sleep(20);
+
+                synchronized (LOCK) {
+                    try {
+                        LOCK.wait(50); // Aumentado para 50ms para reduzir uso de CPU
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
             }
         } catch (Exception e) {
-            System.err.println("Erro durante a leitura: " + e.getMessage());
-            e.printStackTrace();
+            LOGGER.log(Level.SEVERE, "Erro durante a leitura", e);
         } finally {
             // Fecha a porta serial
             if (comPort.isOpen()) {
@@ -105,6 +123,17 @@ public class TinkercadSensorReader {
             }
             scanner.close();
         }
+    }
+
+    private static Thread createInputThread() {
+        Thread inputThread = new Thread(() -> {
+            Scanner consoleScanner = new Scanner(System.in);
+            consoleScanner.nextLine(); // Aguarda o usuário pressionar Enter
+            running = false;
+            System.out.println("Finalizando programa...");
+        });
+        inputThread.setDaemon(true);
+        return inputThread;
     }
 
     // Processa linhas completas e extrai dados dos sensores
@@ -117,41 +146,57 @@ public class TinkercadSensorReader {
 
             if (!line.isEmpty()) {
                 try {
+                    // Verifica se a linha contém dados formatados como JSON
+                    if (line.contains("{") && line.contains("}")) {
+                        // Processamento de formato JSON (implementação futura)
+                        System.out.println("Dados JSON recebidos: " + line);
+                        continue;
+                    }
+
                     // Analisa os dados recebidos conforme o formato do Tinkercad
                     if (line.startsWith("Temperatura:")) {
                         // Formato: "Temperatura: 25.5 °C"
-                        String[] parts = line.split(" ");
+                        String[] parts = line.split(":");
                         if (parts.length >= 2) {
-                            data.temperatura = Float.parseFloat(parts[1]);
+                            String value = parts[1].trim().split(" ")[0];
+                            data.temperatura = Float.parseFloat(value);
                             System.out.println("Temperatura atualizada: " + data.temperatura + " °C");
                         }
                     } else if (line.startsWith("Umidade:")) {
                         // Formato: "Umidade: 60 %"
-                        String[] parts = line.split(" ");
+                        String[] parts = line.split(":");
                         if (parts.length >= 2) {
-                            data.umidade = Integer.parseInt(parts[1]);
-                            System.out.println("Umidade atualizada: " + data.umidade + " %");
+                            String value = parts[1].trim().split(" ")[0];
+                            data.umidade = Integer.parseInt(value);
+                            System.out.println("Umidade atualizada: " + data.umidade + "%");
                         }
                     } else if (line.startsWith("Luminosidade:")) {
                         // Formato: "Luminosidade: 300 lux"
-                        String[] parts = line.split(" ");
+                        String[] parts = line.split(":");
                         if (parts.length >= 2) {
-                            data.luminosidade = Float.parseFloat(parts[1]);
+                            String value = parts[1].trim().split(" ")[0];
+                            data.luminosidade = Float.parseFloat(value);
                             System.out.println("Luminosidade atualizada: " + data.luminosidade + " lux");
+                        }
+                    } else if (line.startsWith("Nivel:") || line.startsWith("Nível:")) {
+                        // Formato: "Nivel: 75 %"
+                        String[] parts = line.split(":");
+                        if (parts.length >= 2) {
+                            String value = parts[1].trim().split(" ")[0];
+                            data.nivelAgua = Integer.parseInt(value);
+                            System.out.println("Nível de água atualizado: " + data.nivelAgua + "%");
 
-                            // Após receber a luminosidade, temos um conjunto completo de dados
-                            // Exibe o resumo completo
+                            // Após receber o nível de água, temos um conjunto completo de dados
                             System.out.println("\n=== LEITURA COMPLETA DOS SENSORES ===");
                             System.out.println(data);
                             System.out.println("=====================================\n");
                         }
+                    } else {
+                        // Dados desconhecidos - exibir para depuração
+                        System.out.println("Dados recebidos (formato desconhecido): " + line);
                     }
-
-                    // Também podemos extrair o nível de água do LCD, mas isso não está sendo enviado
-                    // pela porta serial no código Arduino atual
-
                 } catch (Exception e) {
-                    System.err.println("Erro ao processar linha: '" + line + "' - " + e.getMessage());
+                    LOGGER.log(Level.WARNING, "Erro ao processar linha: '" + line + "'", e);
                 }
             }
         }
